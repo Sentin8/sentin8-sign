@@ -360,6 +360,15 @@ pub struct AdminReopenRequest {
     pub id: String,
 }
 
+/// Reopen response - the reopened request's new state.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct AdminReopenResponse {
+    /// The reopened request id.
+    pub id: uuid::Uuid,
+    /// The request's resulting status (always `open`).
+    pub status: String,
+}
+
 /// `POST /v1/admin/requests` - admin action surface: reopen a failed
 /// request (the only post-completion mutation; DESIGN.md §6 replay).
 #[utoipa::path(
@@ -367,7 +376,7 @@ pub struct AdminReopenRequest {
     path = "/v1/admin/requests",
     request_body = AdminReopenRequest,
     responses(
-        (status = 200, description = "Request reopened (open)"),
+        (status = 200, description = "Request reopened (open)", body = AdminReopenResponse),
         (status = 403, description = "Caller lacks a sign admin scope"),
         (status = 404, description = "Unknown request"),
         (status = 409, description = "Request is not in failed state"),
@@ -379,7 +388,7 @@ pub async fn admin_reopen_failed(
     State(state): State<AppState>,
     headers: HeaderMap,
     axum::Json(req): axum::Json<AdminReopenRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<AdminReopenResponse>, (StatusCode, String)> {
     let a = crate::auth::verify_token(&state.config, &headers).await?;
     a.require_any_scope(WRITE_SCOPES)?;
     let env_id = a.env_id();
@@ -414,5 +423,5 @@ pub async fn admin_reopen_failed(
     tx.commit()
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
-    Ok(Json(serde_json::json!({ "id": id, "status": "open" })))
+    Ok(Json(AdminReopenResponse { id, status: "open".into() }))
 }

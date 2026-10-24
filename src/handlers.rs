@@ -15,7 +15,6 @@ use std::sync::Arc;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
 };
 use utoipa::ToSchema;
 
@@ -48,6 +47,150 @@ fn require_write_scope(_a: &crate::auth::AuthContext) -> Result<(), (StatusCode,
 
 // ── Row mapping ─────────────────────────────────────────────────────────
 
+/// One document of a signature request (the wire projection of the
+/// stored `documents` JSONB) - a storage ref only, never inline bytes.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct DocumentOut {
+    /// Storage object reference.
+    #[serde(rename = "ref")]
+    pub r#ref: String,
+    /// Display name.
+    pub name: String,
+    /// Content hash (what the signature covers).
+    pub hash: String,
+}
+
+/// The request metadata projection - the wire shape of every
+/// request-bearing response (list items, detail, create, evidence).
+#[derive(Debug, Clone, serde::Serialize, ToSchema)]
+pub struct RequestMeta {
+    /// Request id.
+    pub id: uuid::Uuid,
+    /// Human title.
+    pub title: String,
+    /// Lifecycle state: open | completed | declined | expired | failed.
+    pub status: String,
+    /// Signature level: ades | qes.
+    pub signature_level: String,
+    /// Document set (storage refs + names + hashes).
+    pub documents: Vec<DocumentOut>,
+    /// Expiry (RFC 3339; empty when none).
+    pub expires_at: String,
+    /// Creator subject.
+    pub created_by: String,
+    /// Tenant env.
+    pub env_id: uuid::Uuid,
+    /// Completion timestamp (RFC 3339; empty when not completed).
+    pub completed_at: String,
+    /// Creation timestamp (RFC 3339).
+    pub created_at: String,
+    /// Last update timestamp (RFC 3339).
+    pub updated_at: String,
+}
+
+/// A signer within a request response - the ceremony state projection.
+#[derive(Debug, Clone, serde::Serialize, ToSchema)]
+pub struct SignerMeta {
+    /// Signer row id.
+    pub id: uuid::Uuid,
+    /// Owning request.
+    pub request_id: uuid::Uuid,
+    /// Signer user subject.
+    pub user_id: String,
+    /// Ceremony state: pending | viewed | signed | declined.
+    pub status: String,
+    /// First-view timestamp (RFC 3339; empty when not viewed).
+    pub viewed_at: String,
+    /// Signature timestamp (RFC 3339; empty when not signed).
+    pub signed_at: String,
+}
+
+/// A signer inside the evidence bundle - evidence-bearing projection
+/// (never the list shape).
+#[derive(Debug, Clone, serde::Serialize, ToSchema)]
+pub struct SignerEvidence {
+    /// Signer user subject.
+    pub user_id: String,
+    /// Ceremony state.
+    pub status: String,
+    /// First-view timestamp (RFC 3339; empty when not viewed).
+    pub viewed_at: String,
+    /// Signature timestamp (RFC 3339; empty when not signed).
+    pub signed_at: String,
+    /// Provider-minted signature value (empty when not signed).
+    pub signature_value: String,
+    /// Provider attestation + ceremony snapshot (null when not signed).
+    pub evidence: Option<serde_json::Value>,
+}
+
+/// `POST /v1/requests` 201 body.
+#[derive(Debug, serde::Serialize, ToSchema)]
+pub struct RequestCreated {
+    #[serde(flatten)]
+    /// The request metadata.
+    pub request: RequestMeta,
+}
+
+/// `GET /v1/requests/{id}` and evidence 200 body - the request
+/// metadata plus the per-signer ceremony states.
+#[derive(Debug, serde::Serialize, ToSchema)]
+pub struct RequestDetail {
+    #[serde(flatten)]
+    /// The request metadata.
+    pub request: RequestMeta,
+    /// Per-signer states (order = creation order).
+    pub signers: Vec<SignerMeta>,
+}
+
+/// `GET /v1/requests` 200 body.
+#[derive(Debug, serde::Serialize, ToSchema)]
+pub struct RequestList {
+    /// The requests (newest first, capped at 200).
+    pub requests: Vec<RequestMeta>,
+}
+
+/// `POST /v1/requests/{id}/view` 200 body - the ceremony view a signer
+/// receives when opening a request.
+#[derive(Debug, serde::Serialize, ToSchema)]
+pub struct CeremonyView {
+    /// Request id.
+    pub request_id: uuid::Uuid,
+    /// Human title.
+    pub title: String,
+    /// Signature level: ades | qes.
+    pub signature_level: String,
+    /// Document set (storage refs + names + hashes).
+    pub documents: Vec<DocumentOut>,
+    /// The caller's signer state after this view.
+    pub signer_status: String,
+}
+
+/// `POST /v1/requests/{id}/approve` 200 body.
+#[derive(Debug, serde::Serialize, ToSchema)]
+pub struct ApproveResponse {
+    /// Request id.
+    pub request_id: uuid::Uuid,
+    /// The acting signer subject (sign path).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signer: Option<String>,
+    /// Resulting state: declined | signed | completed.
+    pub status: String,
+    /// The provider-minted signature value (sign path).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+/// `POST /v1/internal/schedules/run` 200 body.
+#[derive(Debug, serde::Serialize, ToSchema)]
+pub struct SweepResult {
+    /// The schedule type that ran.
+    pub schedule_type: String,
+    /// Count of requests the sweep expired.
+    pub swept: usize,
+    /// The expired requests (id + env).
+    pub requests: Vec<serde_json::Value>,
+}
+
 /// A fetched `signature_requests` row. Evidence projections NEVER
 /// include document bytes - documents are storage refs only.
 #[derive(sqlx::FromRow, Clone)]
@@ -66,21 +209,31 @@ pub struct RequestRow {
 }
 
 impl RequestRow {
-    /// Metadata projection - request shape without the ceremony details.
-    pub fn metadata(&self) -> serde_json::Value {
-        serde_json::json!({
-            "id": self.id,
-            "title": self.title,
-            "status": self.status,
-            "signature_level": self.signature_level,
-            "documents": self.documents,
-            "expires_at": self.expires_at.map(|e| e.to_rfc3339()).unwrap_or_default(),
-            "created_by": self.created_by,
-            "env_id": self.env_id,
-            "completed_at": self.completed_at.map(|c| c.to_rfc3339()).unwrap_or_default(),
-            "created_at": self.created_at.to_rfc3339(),
-            "updated_at": self.updated_at.to_rfc3339(),
-        })
+    /// Metadata projection - the typed wire shape ([`RequestMeta`]).
+    pub fn metadata(&self) -> RequestMeta {
+        let documents: Vec<DocumentOut> = serde_json::from_value(
+            self.documents.clone(),
+        )
+        .unwrap_or_default();
+        RequestMeta {
+            id: self.id,
+            title: self.title.clone(),
+            status: self.status.clone(),
+            signature_level: self.signature_level.clone(),
+            documents,
+            expires_at: self
+                .expires_at
+                .map(|e| e.to_rfc3339())
+                .unwrap_or_default(),
+            created_by: self.created_by.clone(),
+            env_id: self.env_id,
+            completed_at: self
+                .completed_at
+                .map(|c| c.to_rfc3339())
+                .unwrap_or_default(),
+            created_at: self.created_at.to_rfc3339(),
+            updated_at: self.updated_at.to_rfc3339(),
+        }
     }
 }
 
@@ -101,17 +254,22 @@ pub struct SignerRow {
 }
 
 impl SignerRow {
-    /// Metadata projection - signer ceremony state (evidence included
-    /// only in the evidence endpoint payload, never the list shape).
-    pub fn metadata(&self) -> serde_json::Value {
-        serde_json::json!({
-            "id": self.id,
-            "request_id": self.request_id,
-            "user_id": self.user_id,
-            "status": self.status,
-            "viewed_at": self.viewed_at.map(|v| v.to_rfc3339()).unwrap_or_default(),
-            "signed_at": self.signed_at.map(|s| s.to_rfc3339()).unwrap_or_default(),
-        })
+    /// Metadata projection - the typed wire shape ([`SignerMeta`]).
+    pub fn metadata(&self) -> SignerMeta {
+        SignerMeta {
+            id: self.id,
+            request_id: self.request_id,
+            user_id: self.user_id.clone(),
+            status: self.status.clone(),
+            viewed_at: self
+                .viewed_at
+                .map(|v| v.to_rfc3339())
+                .unwrap_or_default(),
+            signed_at: self
+                .signed_at
+                .map(|s| s.to_rfc3339())
+                .unwrap_or_default(),
+        }
     }
 }
 
@@ -210,7 +368,7 @@ pub struct ApproveRequest {
     path = "/v1/requests",
     request_body = CreateRequest,
     responses(
-        (status = 201, description = "Request created (open)"),
+        (status = 201, description = "Request created (open)", body = RequestCreated),
         (status = 400, description = "Invalid request (empty signers/documents/level)"),
         (status = 409, description = "Idempotency key already used"),
     ),
@@ -221,7 +379,7 @@ pub async fn create_request(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     axum::Json(req): axum::Json<CreateRequest>,
-) -> Result<Response, (StatusCode, String)> {
+) -> Result<(StatusCode, axum::Json<RequestCreated>), (StatusCode, String)> {
     let a = crate::auth::verify_token(&state.config, &headers).await?;
     crate::policy::require_policy(
         &state.policy,
@@ -340,7 +498,7 @@ pub async fn create_request(
     .await?;
 
     tx.commit().await.map_err(db_err)?;
-    Ok((StatusCode::CREATED, axum::Json(row.metadata())).into_response())
+    Ok((StatusCode::CREATED, axum::Json(RequestCreated { request: row.metadata() })))
 }
 
 /// `GET /v1/requests` - list requests for the caller's env.
@@ -350,7 +508,7 @@ pub async fn create_request(
     path = "/v1/requests",
     params(("status" = String, Query, description = "Filter by status")),
     responses(
-        (status = 200, description = "Request metadata list"),
+        (status = 200, description = "Request metadata list", body = RequestList),
         (status = 403, description = "Missing sign scope"),
     ),
     security(("sentin8:sign:request:read" = [])),
@@ -360,7 +518,7 @@ pub async fn list_requests(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     axum::extract::Query(q): axum::extract::Query<ListRequestsQuery>,
-) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<axum::Json<RequestList>, (StatusCode, String)> {
     let a = crate::auth::verify_token(&state.config, &headers).await?;
     crate::policy::require_policy(
         &state.policy,
@@ -398,9 +556,9 @@ pub async fn list_requests(
     };
     tx.commit().await.map_err(db_err)?;
 
-    Ok(axum::Json(serde_json::json!({
-        "requests": rows.iter().map(|r| r.metadata()).collect::<Vec<_>>(),
-    })))
+    Ok(axum::Json(RequestList {
+        requests: rows.iter().map(|r| r.metadata()).collect(),
+    }))
 }
 
 /// Query params for the request list.
@@ -418,7 +576,7 @@ pub struct ListRequestsQuery {
     path = "/v1/requests/{id}",
     params(("id" = uuid::Uuid, Path, description = "Request id")),
     responses(
-        (status = 200, description = "Request detail + signer states"),
+        (status = 200, description = "Request detail + signer states", body = RequestDetail),
         (status = 404, description = "Unknown request"),
     ),
     security(("sentin8:sign:request:read" = [])),
@@ -428,7 +586,7 @@ pub async fn get_request(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(id): Path<uuid::Uuid>,
-) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<axum::Json<RequestDetail>, (StatusCode, String)> {
     let a = crate::auth::verify_token(&state.config, &headers).await?;
     crate::policy::require_policy(
         &state.policy,
@@ -466,9 +624,10 @@ pub async fn get_request(
     .map_err(db_err)?;
     tx.commit().await.map_err(db_err)?;
 
-    let mut payload = row.metadata();
-    payload["signers"] = serde_json::json!(signers.iter().map(|s| s.metadata()).collect::<Vec<_>>());
-    Ok(axum::Json(payload))
+    Ok(axum::Json(RequestDetail {
+        request: row.metadata(),
+        signers: signers.iter().map(|s| s.metadata()).collect(),
+    }))
 }
 
 // ── Ceremony transitions ─────────────────────────────────────────────────
@@ -480,7 +639,7 @@ pub async fn get_request(
     path = "/v1/requests/{id}/view",
     params(("id" = uuid::Uuid, Path, description = "Request id")),
     responses(
-        (status = 200, description = "Ceremony document refs + level"),
+        (status = 200, description = "Ceremony document refs + level", body = CeremonyView),
         (status = 403, description = "Caller is not a listed signer"),
         (status = 404, description = "Unknown request"),
         (status = 409, description = "Request not open"),
@@ -492,7 +651,7 @@ pub async fn view_request(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(id): Path<uuid::Uuid>,
-) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<axum::Json<CeremonyView>, (StatusCode, String)> {
     let a = crate::auth::verify_token(&state.config, &headers).await?;
     crate::policy::require_policy(
         &state.policy,
@@ -575,13 +734,19 @@ pub async fn view_request(
     }
     tx.commit().await.map_err(db_err)?;
 
-    Ok(axum::Json(serde_json::json!({
-        "request_id": req_row.id,
-        "title": req_row.title,
-        "signature_level": req_row.signature_level,
-        "documents": req_row.documents,
-        "signer_status": if signer.status == "pending" { "viewed" } else { &signer.status },
-    })))
+    let documents: Vec<DocumentOut> =
+        serde_json::from_value(req_row.documents.clone()).unwrap_or_default();
+    Ok(axum::Json(CeremonyView {
+        request_id: req_row.id,
+        title: req_row.title,
+        signature_level: req_row.signature_level,
+        documents,
+        signer_status: if signer.status == "pending" {
+            "viewed".to_string()
+        } else {
+            signer.status.clone()
+        },
+    }))
 }
 
 /// `POST /v1/requests/{id}/approve` - the session-bound signer decision.
@@ -596,7 +761,7 @@ pub async fn view_request(
     params(("id" = uuid::Uuid, Path, description = "Request id")),
     request_body = ApproveRequest,
     responses(
-        (status = 200, description = "Decision recorded (signature evidence on sign)"),
+        (status = 200, description = "Decision recorded (signature evidence on sign)", body = ApproveResponse),
         (status = 403, description = "Caller is not a listed signer / session mismatch"),
         (status = 404, description = "Unknown request"),
         (status = 409, description = "Request not open / signer already decided"),
@@ -610,7 +775,7 @@ pub async fn approve_request(
     headers: axum::http::HeaderMap,
     Path(id): Path<uuid::Uuid>,
     axum::Json(req): axum::Json<ApproveRequest>,
-) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<axum::Json<ApproveResponse>, (StatusCode, String)> {
     let a = crate::auth::verify_token(&state.config, &headers).await?;
     crate::policy::require_policy(
         &state.policy,
@@ -714,10 +879,12 @@ pub async fn approve_request(
             )
             .await?;
             tx.commit().await.map_err(db_err)?;
-            Ok(axum::Json(serde_json::json!({
-                "request_id": id,
-                "status": "declined",
-            })))
+            Ok(axum::Json(ApproveResponse {
+                request_id: id,
+                signer: None,
+                status: "declined".into(),
+                signature: None,
+            }))
         }
         _ => {
             // Sign: dispatch through the provider seam (stub mints a
@@ -792,12 +959,12 @@ pub async fn approve_request(
             }
             tx.commit().await.map_err(db_err)?;
 
-            Ok(axum::Json(serde_json::json!({
-                "request_id": id,
-                "signer": a.sub(),
-                "status": if completed { "completed" } else { "signed" },
-                "signature": sig,
-            })))
+            Ok(axum::Json(ApproveResponse {
+                request_id: id,
+                signer: Some(a.sub().to_string()),
+                status: if completed { "completed".into() } else { "signed".into() },
+                signature: Some(sig),
+            }))
         }
     }
 }
@@ -864,7 +1031,7 @@ async fn dispatch_provider(
     path = "/v1/requests/{id}/evidence",
     params(("id" = uuid::Uuid, Path, description = "Request id")),
     responses(
-        (status = 200, description = "Evidence bundle (request + per-signer evidence)"),
+        (status = 200, description = "Evidence bundle (request + per-signer evidence)", body = EvidenceBundle),
         (status = 404, description = "Unknown request"),
     ),
     security(("sentin8:sign:request:read" = [])),
@@ -874,7 +1041,7 @@ pub async fn request_evidence(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(id): Path<uuid::Uuid>,
-) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<axum::Json<EvidenceBundle>, (StatusCode, String)> {
     let a = crate::auth::verify_token(&state.config, &headers).await?;
     crate::policy::require_policy(
         &state.policy,
@@ -912,21 +1079,31 @@ pub async fn request_evidence(
     .map_err(db_err)?;
     tx.commit().await.map_err(db_err)?;
 
-    let mut payload = req_row.metadata();
-    payload["signers"] = serde_json::json!(
-        signers
+    Ok(axum::Json(EvidenceBundle {
+        request: req_row.metadata(),
+        signers: signers
             .iter()
-            .map(|s| serde_json::json!({
-                "user_id": s.user_id,
-                "status": s.status,
-                "viewed_at": s.viewed_at.map(|v| v.to_rfc3339()).unwrap_or_default(),
-                "signed_at": s.signed_at.map(|v| v.to_rfc3339()).unwrap_or_default(),
-                "signature_value": s.signature_value.clone().unwrap_or_default(),
-                "evidence": s.evidence.clone().unwrap_or(serde_json::Value::Null),
-            }))
-            .collect::<Vec<_>>()
-    );
-    Ok(axum::Json(payload))
+            .map(|s| SignerEvidence {
+                user_id: s.user_id.clone(),
+                status: s.status.clone(),
+                viewed_at: s.viewed_at.map(|v| v.to_rfc3339()).unwrap_or_default(),
+                signed_at: s.signed_at.map(|v| v.to_rfc3339()).unwrap_or_default(),
+                signature_value: s.signature_value.clone().unwrap_or_default(),
+                evidence: s.evidence.clone(),
+            })
+            .collect(),
+    }))
+}
+
+/// `GET /v1/requests/{id}/evidence` 200 body - the append-only
+/// evidence bundle: request metadata + per-signer evidence.
+#[derive(Debug, serde::Serialize, ToSchema)]
+pub struct EvidenceBundle {
+    #[serde(flatten)]
+    /// The request metadata.
+    pub request: RequestMeta,
+    /// Per-signer evidence (creation order).
+    pub signers: Vec<SignerEvidence>,
 }
 
 // ── Maintenance ───────────────────────────────────────────────────────────
@@ -939,7 +1116,7 @@ pub async fn request_evidence(
     path = "/v1/internal/schedules/run",
     request_body = ScheduleRunRequest,
     responses(
-        (status = 200, description = "Sweep result"),
+        (status = 200, description = "Sweep result", body = SweepResult),
         (status = 404, description = "Unknown schedule type"),
     ),
     security(("sentin8:cron:write" = [])),
@@ -949,7 +1126,7 @@ pub async fn internal_schedules_run(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     axum::Json(req): axum::Json<ScheduleRunRequest>,
-) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<axum::Json<SweepResult>, (StatusCode, String)> {
     // Internal proxy-back: the M2M identity must carry the cron grant.
     let a = crate::auth::verify_token(&state.config, &headers).await?;
     crate::policy::require_policy(
@@ -1009,11 +1186,11 @@ pub async fn internal_schedules_run(
         }
     }
 
-    Ok(axum::Json(serde_json::json!({
-        "schedule_type": req.schedule_type,
-        "swept": swept.len(),
-        "requests": swept,
-    })))
+    Ok(axum::Json(SweepResult {
+        schedule_type: req.schedule_type,
+        swept: swept.len(),
+        requests: swept,
+    }))
 }
 
 /// Schedule run request body.
