@@ -128,7 +128,7 @@ const M2M_GRANTS: &[sentin8::registration::M2mGrant] = &[
         workload: "sign-cron",
         scopes: &["sentin8:cron:write"],
     },
-    // TLS-RLS-4: the database-free HostContextResolver's resolve
+    // the database-free HostContextResolver's resolve
     // workload - cache miss calls Sys `GET /v1/resolve/hostname`.
     sentin8::registration::M2mGrant {
         workload: "sentin8-sign-tls",
