@@ -70,11 +70,14 @@ endef
 # Infra guarantee (RS §4.5.1-5): PG 18 + Valkey are HARD deps for most of
 # the fleet (RS §5.1).
 define infra_check
-if [ -z "$$(docker compose -f $(PLATFORM)/docker-compose.yml ps --status=running -q 2>/dev/null)" ]; then \
+INFRA_OK=""; \
+for p in 5432 6379; do (echo > /dev/tcp/127.0.0.1/$$p) 2>/dev/null && INFRA_OK="$$INFRA_OK$$p"; done; \
+INFRA_UP=$$(case "$$INFRA_OK" in *5432*6379*) echo yes;; *) echo no;; esac); \
+if [ "$$INFRA_UP" != "yes" ]; then \
         echo "→ dev infra down — starting PG 18 + Valkey (RS §2.2.1)"; \
         docker compose -f $(PLATFORM)/docker-compose.yml up -d >/dev/null || exit 1; \
         for i in $$(seq 1 30); do \
-                n=$$(docker compose -f $(PLATFORM)/docker-compose.yml ps --status=running -q 2>/dev/null | wc -l); \
+                pg=vk=0; (echo > /dev/tcp/127.0.0.1/5432) 2>/dev/null && pg=1; (echo > /dev/tcp/127.0.0.1/6379) 2>/dev/null && vk=1; n=$$((pg+vk)); \
                 [ "$$n" -ge 2 ] && break; \
                 sleep 1; \
         done; \
