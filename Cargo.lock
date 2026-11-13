@@ -4349,7 +4349,7 @@ dependencies = [
 
 [[package]]
 name = "sentin8-sign"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4358,14 +4358,14 @@ dependencies = [
 
 [[package]]
 name = "sentin8-sign-sdk"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "sentin8-sign",
 ]
 
 [[package]]
 name = "sentin8-sign-server"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "axum",
