@@ -14,8 +14,6 @@ use sentin8::registration::{
     AdminScope, AdminUi, AdminUiPage, PgRole, PolicySetDecl, Registration, ScheduleDecl,
     SqlMigration,
 };
-use utoipa::OpenApi;
-
 const PG_ROLES: &[PgRole] = &[PgRole {
     scope: "sentin8:sign:request:read,sentin8:sign:request:write",
     role: "sentin8_sign_service",
@@ -82,9 +80,6 @@ const SQL_1_INIT: &str = include_str!("../sql/init.sql");
 
 /// Serialize the utoipa OpenAPI spec (used for the `all` and `openapi`
 /// sections).
-fn openapi_spec() -> serde_json::Value {
-    serde_json::to_value(crate::openapi::SignOpenApi::openapi()).unwrap_or(serde_json::Value::Null)
-}
 
 /// Default declarative policy sets: action-granular scope permits over
 /// the LIVE effective scope set. Seeded `origin='platform'`,
@@ -142,6 +137,14 @@ const M2M_GRANTS: &[sentin8::registration::M2mGrant] = &[
 /// With `--section=<name>`, outputs only that section as a standalone
 /// JSON value.
 pub fn print(section: Option<String>) -> anyhow::Result<()> {
+        // The utoipa dump lives OUTSIDE this file (OPENAPI_DUMP static in
+    // main.rs/lib.rs): test harnesses embedding this file via #[path] carry
+    // neither the static nor the openapi module and never print a spec.
+    #[cfg(not(test))]
+    let dump: fn() -> serde_json::Value = crate::OPENAPI_DUMP;
+    #[cfg(test)]
+    let dump: fn() -> serde_json::Value = || serde_json::Value::Null;
+
     let reg = Registration {
         service_type: "sentin8:sign",
         subdomain: "sign",
@@ -180,7 +183,7 @@ pub fn print(section: Option<String>) -> anyhow::Result<()> {
         service_actions: None,
         m2m_grants: Some(M2M_GRANTS),
         openapi_url: "/openapi.json",
-        openapi: openapi_spec,
+        openapi: dump,
     };
-    sentin8::registration::print_registration(section, &reg, openapi_spec)
+    sentin8::registration::print_registration(section, &reg, dump)
 }
