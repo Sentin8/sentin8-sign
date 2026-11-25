@@ -8,7 +8,8 @@
       "telemetry_property": {
         "slug": "sign",
         "name": "Sentin8:Sign Platform Telemetry"
-      }
+      },
+      "exposure": "internal"
     }
   ]
 }
